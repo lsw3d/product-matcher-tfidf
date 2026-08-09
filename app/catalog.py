@@ -13,6 +13,8 @@ _PACK_COUNT_RE = re.compile(r"\bуп\.?\s*(\d{2,5})\s*шт\b", re.IGNORECASE)
 
 @dataclass(frozen=True, slots=True)
 class CatalogItem:
+    # Храним рядом с исходными данными заранее извлечённые признаки товара,
+    # чтобы не парсить название каталога заново при каждом поисковом запросе.
     sku: str
     name: str
     unit: str
@@ -41,6 +43,9 @@ class Catalog:
 
         with path.open("r", encoding="utf-8-sig", newline="") as file:
             reader = csv.DictReader(file)
+
+            # Проверяем структуру каталога сразу при загрузке:
+            # matcher дальше может рассчитывать на корректный формат данных.
             missing = cls.REQUIRED_COLUMNS - set(reader.fieldnames or [])
             if missing:
                 raise ValueError(f"Catalog is missing required columns: {sorted(missing)}")
@@ -51,6 +56,9 @@ class Catalog:
                 unit = (row.get("unit") or "").strip()
                 raw_price = (row.get("price") or "").strip()
 
+                # SKU — идентификатор товара, поэтому дубликат означает
+                # неоднозначность каталога и лучше должен сломать запуск,
+                # чем привести к неправильному matched.
                 if not sku or not name:
                     raise ValueError(f"Empty sku/name at CSV line {line_number}")
                 if sku in seen_skus:

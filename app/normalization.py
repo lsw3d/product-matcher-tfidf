@@ -4,7 +4,9 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-
+# Небольшой словарь доменных синонимов.
+# Он нужен не для "понимания языка вообще", а чтобы привести типичные
+# покупательские названия товаров к формулировкам из каталога.
 _DOMAIN_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bболгарк\w*\b"), "ушм"),
     (re.compile(r"\bшурик\w*\b"), "шуруповерт"),
@@ -18,10 +20,14 @@ _DOMAIN_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bлс\b"), "ls"),
 )
 
+# Эти слова почти не помогают определить товар и только создают шум
+# для текстового поиска.
 _QUERY_NOISE_RE = re.compile(
     r"\b(?:здравствуйте|пожалуйста|нужен|нужна|нужны|дайте|какие|какой|какая|есть|сколько|посоветуйте|недорогой|недорогая|в\s+наличии)\b"
 )
 
+# Явные сообщения не про выбор товара отсеиваем до матчинга.
+# Это снижает риск ложного matched — главное требование тестового.
 _NON_PRODUCT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:до\s+скольки|режим\s+работы|работаете)\b"),
     re.compile(r"\b(?:оплатить|оплата|картой|наличными)\b"),
@@ -30,6 +36,9 @@ _NON_PRODUCT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:спасибо|благодарю).*(?:заказ|получил|получила)\b"),
 )
 
+# Помимо текста отдельно извлекаем структурные признаки:
+# размеры, технические коды, количество и единицы измерения.
+# Для товарного каталога они часто важнее простой текстовой похожести.
 _EXPLICIT_DIMENSION_RE = re.compile(
     r"(?<![\w.])(\d+(?:\.\d+)?)"
     r"\s*x\s*(\d+(?:\.\d+)?)"
@@ -52,6 +61,9 @@ _PACK_COUNT_RE = re.compile(
 
 @dataclass(frozen=True, slots=True)
 class QueryFeatures:
+    # Результат разбора сообщения в одном объекте.
+    # Matcher получает уже подготовленные признаки и не занимается
+    # парсингом текста сам.
     normalized: str
     dimensions: tuple[tuple[float, ...], ...]
     codes: frozenset[str]
@@ -62,19 +74,24 @@ class QueryFeatures:
 
 
 def _base_normalize(text: str) -> str:
+    # Приводим разные способы написания одного и того же товара
+    # к максимально единому виду перед сравнением с каталогом.
     text = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
     text = text.replace("×", "x")
     text = re.sub(r"(?<=\d)\s*[хx*]\s*(?=\d)", "x", text)
 
-    # Cyrillic lookalikes in technical codes.
+    # Кириллические буквы в технических обозначениях визуально совпадают
+    # с латинскими: "М10" и "M10" должны считаться одним кодом.
     text = re.sub(r"\bм(?=\s*-?\s*\d)", "m", text)
     text = re.sub(r"\bр(?=\s*-?\s*\d)", "p", text)
 
-    # Canonicalize cable notation ВВГнг(А)-LS -> ввгнг ls.
+    # Приводим распространённое обозначение кабеля к форме,
+    # удобной для сопоставления с каталогом.
     text = re.sub(r"\(\s*а\s*\)\s*-?\s*ls\b", " ls", text)
 
-    # Word-word hyphens are separators; model hyphens (PW-750) are preserved.
+    # Дефис между словами считаем разделителем, но сохраняем его
+    # в модельных обозначениях вроде PW-750.
     text = re.sub(r"(?<=[a-zа-я])-(?=[a-zа-я])", " ", text)
     text = re.sub(r"[()\[\]{},;:!?\"']+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -83,6 +100,7 @@ def _base_normalize(text: str) -> str:
 
 def normalize_text(text: str) -> str:
     text = _base_normalize(text)
+    # Нормализуем несколько частых способов выражения характеристик.
     text = re.sub(r"\bполтора\b", "1.5", text)
     text = re.sub(r"\bметров(?:ая|ый|ую|ые)\b", "1000 мм", text)
 
@@ -93,6 +111,7 @@ def normalize_text(text: str) -> str:
 
 
 def _normalize_code(value: str) -> str:
+    # PW-750, PW 750 и pw750 должны сравниваться как один код.
     return value.lower().replace(" ", "").replace("-", "")
 
 
@@ -105,11 +124,13 @@ def extract_dimensions(text: str) -> tuple[tuple[float, ...], ...]:
     normalized = normalize_text(text)
     result: list[tuple[float, ...]] = []
 
+    # Явные размеры: 20x20, 4.2x75, 20x20x2.
     for match in _EXPLICIT_DIMENSION_RE.finditer(normalized):
         result.append(tuple(float(v) for v in match.groups() if v is not None))
 
-    # Natural-language dimensions. "190 на 48 зубьев" is diameter + tooth count,
-    # not a 190x48 geometric size.
+    # Также понимаем разговорное "6 на 110".
+    # Но "190 на 48 зубьев" — это диаметр и число зубьев,
+    # а не геометрический размер 190x48.
     for match in _ON_DIMENSION_RE.finditer(normalized):
         tail = normalized[match.end() : match.end() + 20]
         if re.search(r"\bзуб", tail):
@@ -136,6 +157,8 @@ def extract_pack_count(text: str) -> int | None:
 
 
 def extract_unit_hint(text: str) -> str | None:
+    # Единица продажи помогает различать похожие позиции:
+    # например товар за метр и товар за упаковку.
     normalized = normalize_text(text)
     if re.search(r"\b(?:пачк\w*|упаковк\w*)\b", normalized):
         return "уп"
@@ -154,12 +177,16 @@ def is_explicitly_non_product(text: str) -> bool:
 
 
 def retrieval_text(text: str) -> str:
+    # Для TF-IDF оставляем товарно-значимую часть сообщения,
+    # убирая вежливость и служебные слова.
     normalized = normalize_text(text)
     normalized = _QUERY_NOISE_RE.sub(" ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()
 
 
 def parse_query(text: str) -> QueryFeatures:
+    # Единая точка разбора запроса: matcher дальше работает
+    # с готовым набором текстовых и структурных признаков.
     return QueryFeatures(
         normalized=normalize_text(text),
         dimensions=extract_dimensions(text),

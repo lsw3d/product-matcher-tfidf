@@ -82,3 +82,5 @@ def test_empty_batch(client: TestClient) -> None:
 def test_invalid_contract_returns_422(client: TestClient) -> None:
     assert client.post("/match", json={}).status_code == 422
     assert client.post("/match", json={"messages": "oops"}).status_code == 422
+    assert client.post("/match", json={"messages": [123]}).status_code == 422
+    assert client.post("/match", json={"messages": [None]}).status_code == 422

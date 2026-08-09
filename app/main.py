@@ -25,6 +25,6 @@ app = FastAPI(title="Product Matcher", lifespan=lifespan)
 
 
 @app.post("/match", response_model=MatchResponse)
-async def match_products(payload: MatchRequest, request: Request) -> MatchResponse:
+def match_products(payload: MatchRequest, request: Request) -> MatchResponse:
     matcher: ProductMatcher = request.app.state.matcher
     return MatchResponse(results=matcher.match_many(payload.messages))

@@ -1,46 +1,47 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from app.catalog import Catalog, CatalogItem
 from app.normalization import (
     QueryFeatures,
-    is_explicitly_non_product,
-    lexical_text,
+    code_variants,
+    contains_negative_number,
+    is_one_edit_apart,
     parse_query,
-    retrieval_text,
+    token_key,
 )
 from app.schemas import Candidate, MatchResult
 
 
+_ADJECTIVE_RE = re.compile(r"(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ых|их|ым|им|ую|юю|ого|его|ому|ему)$")
+
+
 @dataclass(frozen=True, slots=True)
 class _Ranked:
-    # Внутреннее представление кандидата:
-    # отдельно храним исходную текстовую близость и итоговый score после rerank.
     item: CatalogItem
-    text_score: float
     score: float
+    noise_tokens: int
 
 
 class ProductMatcher:
     """Conservative offline matcher: char n-gram retrieval + hard constraints."""
 
-    # Пороги настроены консервативно: по ТЗ лучше вернуть ambiguous/not_found,
-    # чем уверенно сопоставить сообщение с неправильным товаром.
     MATCH_THRESHOLD = 0.46
     AMBIGUOUS_THRESHOLD = 0.18
-    LEXICAL_COMPATIBILITY_THRESHOLD = 0.18
     MATCH_MARGIN = 0.06
     AMBIGUOUS_WINDOW = 0.10
     MAX_AMBIGUOUS_CANDIDATES = 3
+    LEXICAL_TOKEN_SIMILARITY_THRESHOLD = 0.76
+    MIN_FUZZY_TOKEN_LENGTH = 4
+    NOISE_TOKEN_PENALTY = 0.92
 
     def __init__(self, catalog: Catalog) -> None:
         self.catalog = catalog
-
-        # Символьные n-граммы устойчивы к опечаткам и вариациям написания:
-        # например "дрел" всё ещё будет близко к "дрель".
         self.vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=(3, 5),
@@ -49,308 +50,375 @@ class ProductMatcher:
             norm="l2",
             min_df=1,
         )
-
-        # Индекс каталога строится один раз, дальше каждый запрос
-        # сравнивается с уже готовой разреженной матрицей.
         self.catalog_matrix = self.vectorizer.fit_transform(
-            [item.normalized_name for item in catalog.items]
+            item.normalized_name for item in catalog.items
         ).tocsr()
+        self.catalog_lexical_tokens = [
+            tuple(token for token in item.lexical_name.split() if len(token) >= 3)
+            for item in catalog.items
+        ]
+        self.catalog_family_tokens = tuple(
+            dict.fromkeys(tokens[0] for tokens in self.catalog_lexical_tokens if tokens)
+        )
+        self.catalog_vocabulary = {
+            token_key(token)
+            for tokens in self.catalog_lexical_tokens
+            for token in tokens
+        }
+        self.families_by_key = {
+            token_key(family): family
+            for family in self.catalog_family_tokens
+        }
+        self.catalog_codes_by_variant: dict[str, str] = {}
+        for item in catalog.items:
+            for code in item.codes:
+                for variant in code_variants(code):
+                    self.catalog_codes_by_variant.setdefault(variant, code)
 
     def match(self, message: str) -> MatchResult:
-        # Сразу отсекаем пустые сообщения и известные нетоварные запросы,
-        # чтобы fuzzy-поиск случайно не подобрал к ним товар.
-        if not message.strip() or is_explicitly_non_product(message):
+        if not message.strip() or contains_negative_number(message):
             return self._not_found(message)
 
         features = parse_query(message)
-
         if len(features.normalized) < 2:
             return self._not_found(message)
 
-        # Первый этап — широкий retrieval по текстовой похожести.
-        query_text = retrieval_text(message)
-        query_vector = self.vectorizer.transform([query_text])
-        similarities = (
-            self.catalog_matrix @ query_vector.T
-        ).toarray().ravel()
-
-        if (
-            similarities.size == 0
-            or float(similarities.max()) < self.AMBIGUOUS_THRESHOLD
-        ):
+        # Вопрос про доставку или возврат отсекаем, только если товар не назван:
+        # `когда доставите кабель?` - не заказ, а `кабель ввгнг 3х1.5 с
+        # доставкой` - вполне.
+        if features.non_product and not self._names_a_product(features):
             return self._not_found(message)
 
-        # Размеры, мощность и коды помогают выбрать вариант товара, но не
-        # должны сами доказывать его тип. Поэтому отдельно проверяем текстовую
-        # близость запроса без числовых характеристик и моделей.
-        lexical_query = lexical_text(message)
-        lexical_similarities = None
-
-        if lexical_query:
-            lexical_vector = self.vectorizer.transform([lexical_query])
-            lexical_similarities = (
-                self.catalog_matrix @ lexical_vector.T
-            ).toarray().ravel()
-
-        ranked: list[_Ranked] = []
-
-        for idx, text_score_raw in enumerate(similarities):
-            item = self.catalog.items[idx]
-            text_score = float(text_score_raw)
-
-            # TF-IDF отвечает только за поиск похожих товаров.
-            # После него применяем строгие товарные ограничения:
-            # размеры, модель, напряжение, упаковку и т.д.
-            if text_score < self.AMBIGUOUS_THRESHOLD:
-                continue
-
-            if (
-                lexical_similarities is not None
-                and float(lexical_similarities[idx])
-                < self.LEXICAL_COMPATIBILITY_THRESHOLD
-            ):
-                continue
-
-            if not self._hard_compatible(item, features):
-                continue
-
-            ranked.append(
-                _Ranked(
-                    item=item,
-                    text_score=text_score,
-                    score=self._rerank(text_score, features),
-                )
-            )
-
-        ranked.sort(
-            key=lambda result: result.score,
-            reverse=True,
+        lexical_tokens = tuple(
+            token for token in features.lexical.split() if len(token) >= 3
         )
+        family_match = self._find_explicit_family(lexical_tokens)
+        explicit_family = family_match[1] if family_match else None
+        query_text = self._anchor_codes(features.retrieval, features.codes)
+        anchored_tokens = lexical_tokens
 
+        if family_match is not None:
+            query_family, catalog_family = family_match
+            if query_family != catalog_family:
+                query_text = f"{query_text} {catalog_family}"
+                anchored_tokens = tuple(
+                    catalog_family if token == query_family else token
+                    for token in lexical_tokens
+                )
+
+        similarities = (self.catalog_matrix @ self.vectorizer.transform([query_text]).T).toarray().ravel()
+        if not similarities.size or float(similarities.max()) < self.AMBIGUOUS_THRESHOLD:
+            return self._not_found(message)
+
+        ranked = self._rank_candidates(
+            similarities,
+            lexical_tokens,
+            anchored_tokens,
+            explicit_family,
+            features,
+        )
         if not ranked or ranked[0].score < self.AMBIGUOUS_THRESHOLD:
             return self._not_found(message)
 
         top = ranked[0]
+        has_constraints = bool(
+            features.dimensions
+            or features.codes
+            or features.qualifiers
+            or features.quantities
+            or features.numbers
+            or features.pack_count is not None
+            or features.unit_hint is not None
+        )
+        if (
+            explicit_family is not None
+            and len(anchored_tokens) - top.noise_tokens == 1
+            and not has_constraints
+            and len(ranked) >= 2
+        ):
+            return self._ambiguous(message, ranked[: self.MAX_AMBIGUOUS_CANDIDATES])
 
-        # После нормализации и удаления разговорного шума точное название
-        # позиции — достаточное основание для matched даже при наличии очень
-        # похожей соседней модификации в каталоге.
-        if query_text == top.item.normalized_name:
-            return MatchResult(
-                message=message,
-                status="matched",
-                candidates=[self._candidate(top)],
-            )
+        exact_name_is_unique = not any(
+            query_text == candidate.item.normalized_name for candidate in ranked[1:]
+        )
+        if query_text == top.item.normalized_name and exact_name_is_unique:
+            return self._matched(message, top)
 
-        second = ranked[1].score if len(ranked) > 1 else 0.0
-        margin = top.score - second
-
-        # Для matched недостаточно просто высокого score:
-        # лидер должен ещё заметно отрываться от второго кандидата.
+        second_score = ranked[1].score if len(ranked) > 1 else 0.0
         if (
             top.score >= self.MATCH_THRESHOLD
-            and margin >= self.MATCH_MARGIN
+            and top.score - second_score >= self.MATCH_MARGIN
         ):
-            return MatchResult(
-                message=message,
-                status="matched",
-                candidates=[self._candidate(top)],
-            )
+            if not self._competes_by_unasked_application(ranked, features):
+                return self._matched(message, top)
+            # Отрыв лидера ничего не доказывает, поэтому окно близости здесь
+            # не применяем: показываем сами варианты назначения.
+            return self._ambiguous(message, ranked[: self.MAX_AMBIGUOUS_CANDIDATES])
 
-        # Если уверенного лидера нет, возвращаем несколько близких вариантов.
         candidates = [
-            result
-            for result in ranked
-            if result.score >= self.AMBIGUOUS_THRESHOLD
-            and result.score >= top.score - self.AMBIGUOUS_WINDOW
+            candidate
+            for candidate in ranked
+            if candidate.score >= self.AMBIGUOUS_THRESHOLD
+            and candidate.score >= top.score - self.AMBIGUOUS_WINDOW
         ][: self.MAX_AMBIGUOUS_CANDIDATES]
+        return self._ambiguous(message, candidates) if len(candidates) >= 2 else self._not_found(message)
 
-        if len(candidates) >= 2:
-            return MatchResult(
-                message=message,
-                status="ambiguous",
-                candidates=[
-                    self._candidate(candidate)
-                    for candidate in candidates
-                ],
-            )
-
-        # Один слабый fuzzy-кандидат считаем недостаточным основанием для ответа.
-        return self._not_found(message)
-
-    def match_many(
+    def _rank_candidates(
         self,
-        messages: list[str],
-    ) -> list[MatchResult]:
-        return [
-            self.match(message)
-            for message in messages
-        ]
+        similarities,
+        lexical_tokens: tuple[str, ...],
+        anchored_tokens: tuple[str, ...],
+        explicit_family: str | None,
+        features: QueryFeatures,
+    ) -> list[_Ranked]:
+        ranked = []
+        for index, raw_score in enumerate(similarities):
+            text_score = float(raw_score)
+            if text_score < self.AMBIGUOUS_THRESHOLD:
+                continue
+
+            item = self.catalog.items[index]
+            item_tokens = self.catalog_lexical_tokens[index]
+            noise_tokens = 0
+            if lexical_tokens:
+                if explicit_family is not None:
+                    if not item_tokens or not self._tokens_are_similar(explicit_family, item_tokens[0]):
+                        continue
+                else:
+                    first_key = token_key(lexical_tokens[0])
+                    if not any(first_key == token_key(token) for token in item_tokens):
+                        continue
+                counted = self._count_noise_tokens(anchored_tokens, item_tokens, explicit_family)
+                if counted is None:
+                    continue
+                noise_tokens = counted
+
+            if self._hard_compatible(item, features):
+                score = self._rerank(text_score, features) * self.NOISE_TOKEN_PENALTY**noise_tokens
+                ranked.append(_Ranked(item, score, noise_tokens))
+        return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
+
+    def match_many(self, messages: list[str]) -> list[MatchResult]:
+        return [self.match(message) for message in messages]
 
     @staticmethod
-    def _hard_compatible(
-        item: CatalogItem,
-        query: QueryFeatures,
+    def _names_a_product(features: QueryFeatures) -> bool:
+        return bool(features.dimensions or features.codes or features.quantities)
+
+    @staticmethod
+    def _competes_by_unasked_application(
+        ranked: list[_Ranked],
+        features: QueryFeatures,
     ) -> bool:
-        # Явно указанные покупателем характеристики считаем жёсткими условиями.
-        # Например запрос M10 не должен матчиться с M8 даже при похожем названии.
-        if (
-            query.unit_hint is not None
-            and item.unit != query.unit_hint
+        """Спорят ли лидер и конкурент назначением, о котором не спрашивали.
+
+        `сверло 10 мм` одинаково описывает сверло по дереву, по бетону и по
+        металлу. Отрыв лидера здесь создаёт не запрос, а частотность слов в
+        каталоге, поэтому честнее вернуть кандидатов, чем угадать назначение
+        за покупателя.
+        """
+        if len(ranked) < 2 or any(
+            qualifier.startswith("application:") for qualifier in features.qualifiers
         ):
             return False
 
+        applications = [
+            {
+                qualifier
+                for qualifier in candidate.item.qualifiers
+                if qualifier.startswith("application:")
+            }
+            for candidate in ranked[:2]
+        ]
+        return all(applications) and applications[0] != applications[1]
+
+    def _anchor_codes(self, query_text: str, codes: frozenset[str]) -> str:
+        # Кириллическая запись кода (`т30`, `рн2`) не даёт общих n-грамм с
+        # каталожной (`t30`, `ph2`), поэтому дописываем каталожное написание.
+        catalog_codes = []
+        for code in sorted(codes):
+            if code in self.catalog_codes_by_variant:
+                continue
+            catalog_code = next(
+                (
+                    self.catalog_codes_by_variant[variant]
+                    for variant in sorted(code_variants(code))
+                    if variant in self.catalog_codes_by_variant
+                ),
+                None,
+            )
+            if catalog_code is not None:
+                catalog_codes.append(catalog_code)
+        return " ".join([query_text, *catalog_codes]) if catalog_codes else query_text
+
+    def _find_explicit_family(
+        self,
+        query_tokens: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        for query in query_tokens:
+            if family := self.families_by_key.get(token_key(query)):
+                return query, family
+
+        for query in query_tokens:
+            for family in self.catalog_family_tokens:
+                if self._tokens_are_similar(query, family):
+                    return query, family
+        return None
+
+    def _count_noise_tokens(
+        self,
+        query_tokens: tuple[str, ...],
+        item_tokens: tuple[str, ...],
+        family: str | None,
+    ) -> int | None:
+        """Сколько слов запроса товар не объясняет, или None при конфликте.
+
+        Требовать, чтобы каждое слово запроса нашлось в названии товара,
+        нельзя: покупатель пишет живым языком и добавляет `подскажите`,
+        `самовывоз`, `в бухте`. Но и игнорировать всё подряд опасно, поэтому
+        непривязанное слово отбрасывает кандидата в двух случаях: каталог
+        знает это слово (значит, оно противоречит товару) либо оно стоит на
+        месте уточнения типа сразу после названия семейства.
+        """
+        anchor = query_tokens.index(family) if family in query_tokens else 0
+        noise = 0
+        for position, token in enumerate(query_tokens):
+            if any(self._tokens_are_similar(token, item) for item in item_tokens):
+                continue
+            if token_key(token) in self.catalog_vocabulary:
+                return None
+            if position == anchor + 1:
+                return None
+            if position == anchor - 1 and _ADJECTIVE_RE.search(token):
+                return None
+            noise += 1
+        return noise
+
+    @classmethod
+    def _tokens_are_similar(cls, left: str, right: str) -> bool:
+        left_key = token_key(left)
+        right_key = token_key(right)
+        if left_key == right_key:
+            return True
+        # Для коротких основ одна правка меняет слишком многое: иначе `дела`
+        # сойдёт за опечатку в `дрель`.
+        if min(len(left_key), len(right_key)) < cls.MIN_FUZZY_TOKEN_LENGTH:
+            return False
+        if left_key[:1] == right_key[:1] and is_one_edit_apart(left_key, right_key):
+            return True
         if (
-            query.pack_count is not None
-            and item.pack_count != query.pack_count
+            len(left_key) >= 4
+            and len(right_key) >= 4
+            and left_key[:3] != right_key[:3]
+        ):
+            return False
+        return SequenceMatcher(None, left_key, right_key).ratio() >= cls.LEXICAL_TOKEN_SIMILARITY_THRESHOLD
+
+    @staticmethod
+    def _hard_compatible(item: CatalogItem, query: QueryFeatures) -> bool:
+        if query.unit_hint is not None and item.unit != query.unit_hint:
+            return False
+        if query.pack_count is not None and item.pack_count != query.pack_count:
+            return False
+        if any(
+            not (code_variants(code) & item.code_variants) for code in query.codes
         ):
             return False
 
-        if (
-            query.codes
-            and not query.codes.issubset(item.codes)
+        query_colors = {value for value in query.qualifiers if value.startswith("color:")}
+        item_colors = {value for value in item.qualifiers if value.startswith("color:")}
+        if query_colors and query_colors != item_colors:
+            return False
+        if not (query.qualifiers - query_colors).issubset(item.qualifiers):
+            return False
+
+        quantity_values = {value for value, _ in query.quantities}
+        if not (query.numbers - quantity_values).issubset(item.numbers):
+            return False
+        if any(
+            not any(ProductMatcher._dimension_prefix_match(requested, actual) for actual in item.dimensions)
+            for requested in query.dimensions
         ):
             return False
 
-        if (
-            query.qualifiers
-            and not query.qualifiers.issubset(item.qualifiers)
-        ):
-            return False
-
-        if (
-            query.numbers
-            and not query.numbers.issubset(item.numbers)
-        ):
-            return False
-
-        for requested in query.dimensions:
-            if not any(
-                ProductMatcher._dimension_prefix_match(
-                    requested,
-                    actual,
-                )
-                for actual in item.dimensions
-            ):
-                return False
-
-        # Величина в той же единице, в которой продаётся позиция, описывает
-        # объём заказа, а не характеристику SKU: например "10 м кабеля".
-        # Остальные величины (125 мм, 12 В, 750 Вт) остаются hard constraints.
-        dimension_values = {
-            value
-            for dimension in query.dimensions
-            for value in dimension
-        }
-
-        item_quantity_set = set(item.quantities)
-        item_dimension_values = {
-            value
-            for dimension in item.dimensions
-            for value in dimension
+        dimension_values = {value for dimension in query.dimensions for value in dimension}
+        item_quantities = set(item.quantities)
+        item_dimension_values = {value for dimension in item.dimensions for value in dimension}
+        item_lengths_mm = {
+            converted
+            for value, unit in item.quantities
+            if (converted := ProductMatcher._length_in_mm(value, unit)) is not None
         }
 
         for value, unit in query.quantities:
-            if (
-                value in dimension_values
-                or value in item_dimension_values
-                or unit == item.unit
+            if value in dimension_values:
+                if unit == "мм":
+                    continue
+                return False
+            if unit == item.unit or (value, unit) in item_quantities:
+                continue
+            length_mm = ProductMatcher._length_in_mm(value, unit)
+            if length_mm is not None and (
+                length_mm in item_dimension_values or length_mm in item_lengths_mm
             ):
                 continue
-
-            if (value, unit) not in item_quantity_set:
-                return False
-
+            return False
         return True
+
+    @staticmethod
+    def _length_in_mm(value: float, unit: str) -> float | None:
+        factor = {"мм": 1.0, "см": 10.0, "м": 1000.0}.get(unit)
+        return value * factor if factor is not None else None
 
     @staticmethod
     def _dimension_prefix_match(
         requested: tuple[float, ...],
         actual: tuple[float, ...],
     ) -> bool:
-        # Частично указанный размер допустим:
-        # запрос 20x20 может соответствовать позиции 20x20x2.
-        if len(requested) > len(actual):
-            return False
-
-        return requested == actual[: len(requested)]
+        return len(requested) <= len(actual) and requested == actual[: len(requested)]
 
     @staticmethod
-    def _rerank(
-        text_score: float,
-        query: QueryFeatures,
-    ) -> float:
-        # Структурные признаки повышают уверенность, но не складываются с
-        # similarity напрямую. Так score остаётся в [0, 1], а один и тот же
-        # размер не может несколько раз искусственно довести confidence до 1.0.
-        structural_strength = 0.0
-
-        if query.dimensions:
-            structural_strength += 0.30
-
-        if query.codes:
-            structural_strength += 0.25
-
-        if query.qualifiers:
-            structural_strength += 0.12
-
-        dimension_values = {
-            value
-            for dimension in query.dimensions
-            for value in dimension
-        }
-
+    def _rerank(text_score: float, query: QueryFeatures) -> float:
+        dimension_values = {value for dimension in query.dimensions for value in dimension}
         has_independent_quantity = any(
-            value not in dimension_values
-            for value, _ in query.quantities
+            value not in dimension_values for value, _ in query.quantities
         )
-
-        if has_independent_quantity:
-            structural_strength += 0.15
-
-        # Голые технические числа полезны для запросов вроде "УШМ на 230"
-        # или "диск 190 на 48 зубьев". Если уже есть более точный структурный
-        # признак, отдельный бонус за те же числа не начисляем.
-        if query.numbers and not (
-            query.dimensions
-            or query.codes
-            or has_independent_quantity
-        ):
-            structural_strength += 0.16
-
-        if query.pack_count is not None:
-            structural_strength += 0.15
-
-        if query.unit_hint is not None:
-            structural_strength += 0.08
-
-        structural_strength = min(
-            structural_strength,
-            0.55,
+        structural_strength = sum(
+            bonus
+            for condition, bonus in (
+                (bool(query.dimensions), 0.30),
+                (bool(query.codes), 0.25),
+                (bool(query.qualifiers), 0.12),
+                (has_independent_quantity, 0.15),
+                (
+                    bool(query.numbers)
+                    and not (query.dimensions or query.codes or has_independent_quantity),
+                    0.16,
+                ),
+                (query.pack_count is not None, 0.15),
+                (query.unit_hint is not None, 0.08),
+            )
+            if condition
         )
-
-        # Бонус приближает score к 1, но никогда не пересекает её и сохраняет
-        # различия между кандидатами с разной исходной текстовой похожестью.
-        return (
-            text_score
-            + (1.0 - text_score) * structural_strength
-        )
+        strength = min(structural_strength, 0.55)
+        return text_score + (1.0 - text_score) * strength
 
     @staticmethod
-    def _candidate(
-        result: _Ranked,
-    ) -> Candidate:
-        return Candidate(
-            sku=result.item.sku,
-            confidence=round(result.score, 3),
-        )
+    def _candidate(result: _Ranked) -> Candidate:
+        return Candidate(sku=result.item.sku, confidence=round(result.score, 3))
 
-    @staticmethod
-    def _not_found(
-        message: str,
-    ) -> MatchResult:
+    @classmethod
+    def _matched(cls, message: str, result: _Ranked) -> MatchResult:
+        return MatchResult(message=message, status="matched", candidates=[cls._candidate(result)])
+
+    @classmethod
+    def _ambiguous(cls, message: str, results: list[_Ranked]) -> MatchResult:
         return MatchResult(
             message=message,
-            status="not_found",
-            candidates=[],
+            status="ambiguous",
+            candidates=[cls._candidate(result) for result in results],
         )
+
+    @staticmethod
+    def _not_found(message: str) -> MatchResult:
+        return MatchResult(message=message, status="not_found", candidates=[])

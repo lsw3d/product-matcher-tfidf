@@ -1,21 +1,11 @@
 from __future__ import annotations
 
 import csv
-import re
 from dataclasses import dataclass
+import math
 from pathlib import Path
 
-from app.normalization import (
-    extract_codes,
-    extract_dimensions,
-    extract_numbers,
-    extract_qualifiers,
-    extract_quantities,
-    normalize_text,
-)
-
-
-_PACK_COUNT_RE = re.compile(r"\bуп\.?\s*(\d{2,5})\s*шт\b", re.IGNORECASE)
+from app.normalization import parse_item
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +17,10 @@ class CatalogItem:
     unit: str
     price: float
     normalized_name: str
+    lexical_name: str
     dimensions: tuple[tuple[float, ...], ...]
     codes: frozenset[str]
+    code_variants: frozenset[str]
     qualifiers: frozenset[str]
     quantities: tuple[tuple[float, str], ...]
     numbers: frozenset[float]
@@ -64,9 +56,9 @@ class Catalog:
                 unit = (row.get("unit") or "").strip()
                 raw_price = (row.get("price") or "").strip()
 
-                if not sku or not name:
+                if not sku or not name or not unit:
                     raise ValueError(
-                        f"Empty sku/name at CSV line {line_number}"
+                        f"Empty sku/name/unit at CSV line {line_number}"
                     )
 
                 if sku in seen_skus:
@@ -82,25 +74,28 @@ class Catalog:
                         f"{line_number}: {raw_price!r}"
                     ) from exc
 
-                pack_match = _PACK_COUNT_RE.search(normalize_text(name))
+                if not math.isfinite(price) or price < 0:
+                    raise ValueError(
+                        f"Invalid price at CSV line "
+                        f"{line_number}: {raw_price!r}"
+                    )
 
+                features = parse_item(name)
                 items.append(
                     CatalogItem(
                         sku=sku,
                         name=name,
                         unit=unit,
                         price=price,
-                        normalized_name=normalize_text(name),
-                        dimensions=extract_dimensions(name),
-                        codes=extract_codes(name),
-                        qualifiers=extract_qualifiers(name),
-                        quantities=extract_quantities(name),
-                        numbers=extract_numbers(name),
-                        pack_count=(
-                            int(pack_match.group(1))
-                            if pack_match
-                            else None
-                        ),
+                        normalized_name=features.normalized,
+                        lexical_name=features.lexical,
+                        dimensions=features.dimensions,
+                        codes=features.codes,
+                        code_variants=features.code_variants,
+                        qualifiers=features.qualifiers,
+                        quantities=features.quantities,
+                        numbers=features.numbers,
+                        pack_count=features.pack_count,
                     )
                 )
 

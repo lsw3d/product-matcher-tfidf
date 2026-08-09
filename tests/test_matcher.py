@@ -29,8 +29,13 @@ from app.matcher import ProductMatcher
         ("дюбель-гвоздь 6х60", "KRP-0048"),
     ],
 )
-def test_known_product_is_matched(matcher: ProductMatcher, message: str, expected_sku: str) -> None:
+def test_known_product_is_matched(
+    matcher: ProductMatcher,
+    message: str,
+    expected_sku: str,
+) -> None:
     result = matcher.match(message)
+
     assert result.status == "matched"
     assert result.candidates[0].sku == expected_sku
 
@@ -47,10 +52,15 @@ def test_known_product_is_matched(matcher: ProductMatcher, message: str, expecte
         "сверло нужно",
         "какие есть диски",
         "перфоратор посоветуйте",
+        "шуруповерт как у макиты, только дешевле",
     ],
 )
-def test_underspecified_query_is_ambiguous(matcher: ProductMatcher, message: str) -> None:
+def test_underspecified_query_is_ambiguous(
+    matcher: ProductMatcher,
+    message: str,
+) -> None:
     result = matcher.match(message)
+
     assert result.status == "ambiguous"
     assert 2 <= len(result.candidates) <= 3
 
@@ -70,17 +80,25 @@ def test_underspecified_query_is_ambiguous(matcher: ProductMatcher, message: str
         "где находится ваш магазин",
         "статус заказа 4512 подскажите",
         "спасибо, заказ получил, все отлично",
+        "хочу вернуть дрель",
+        "когда доставите кабель?",
+        "дрель bosch 750 вт",
         "",
         "!!!",
     ],
 )
-def test_missing_or_non_product_is_not_found(matcher: ProductMatcher, message: str) -> None:
+def test_missing_or_non_product_is_not_found(
+    matcher: ProductMatcher,
+    message: str,
+) -> None:
     result = matcher.match(message)
+
     assert result.status == "not_found"
     assert result.candidates == []
 
 
 def test_unknown_typo_not_overfit_to_examples(matcher: ProductMatcher) -> None:
     result = matcher.match("самарез по дереву 3.5х45 пачка 200")
+
     assert result.status == "matched"
     assert result.candidates[0].sku == "SAM-0010"

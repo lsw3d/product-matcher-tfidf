@@ -2,6 +2,7 @@ from app.normalization import (
     extract_codes,
     extract_dimensions,
     extract_numbers,
+    extract_qualifiers,
     normalize_text,
 )
 
@@ -21,6 +22,12 @@ def test_only_domain_aliases_are_normalized() -> None:
     )
     assert "ушм" in normalize_text(
         "шлифовальная машина 230"
+    )
+    assert "ленточная шлифмашина" in normalize_text(
+        "ленточная шлифовальная машина 900 вт"
+    )
+    assert "ушм" not in normalize_text(
+        "ленточная шлифовальная машина 900 вт"
     )
     assert "шуруповерт" in normalize_text(
         "шурик на 12в"
@@ -114,3 +121,29 @@ def test_technical_numbers_are_preserved() -> None:
         190.0,
         48.0,
     })
+
+def test_thread_size_is_both_code_and_dimension() -> None:
+    assert "m10" in extract_codes(
+        "болт М10х60"
+    )
+    assert (10.0, 60.0) in extract_dimensions(
+        "болт М10х60"
+    )
+
+
+def test_semantic_qualifiers() -> None:
+    assert extract_qualifiers(
+        "диск пильный по металлу"
+    ) == frozenset({"application:metal"})
+
+    assert extract_qualifiers(
+        "уровень лазерный"
+    ) == frozenset({"level:laser"})
+
+    assert extract_qualifiers(
+        "гайка самоконтрящаяся"
+    ) == frozenset({"fastener:self_locking"})
+
+    assert extract_qualifiers(
+        "ленточная шлифовальная машина"
+    ) == frozenset({"grinder:belt"})

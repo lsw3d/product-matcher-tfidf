@@ -180,6 +180,12 @@ class ProductMatcher:
             return False
 
         if (
+            query.qualifiers
+            and not query.qualifiers.issubset(item.qualifiers)
+        ):
+            return False
+
+        if (
             query.numbers
             and not query.numbers.issubset(item.numbers)
         ):
@@ -205,10 +211,16 @@ class ProductMatcher:
         }
 
         item_quantity_set = set(item.quantities)
+        item_dimension_values = {
+            value
+            for dimension in item.dimensions
+            for value in dimension
+        }
 
         for value, unit in query.quantities:
             if (
                 value in dimension_values
+                or value in item_dimension_values
                 or unit == item.unit
             ):
                 continue
@@ -245,6 +257,9 @@ class ProductMatcher:
 
         if query.codes:
             structural_strength += 0.25
+
+        if query.qualifiers:
+            structural_strength += 0.12
 
         dimension_values = {
             value

@@ -6,6 +6,23 @@ from dataclasses import dataclass
 
 
 _DOMAIN_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Сначала сохраняем явно указанный тип шлифмашины, чтобы более общий
+    # alias ниже не превратил ленточную/орбитальную машину в УШМ.
+    (
+        re.compile(r"\bленточн\w*\s+шлифовальн\w*\s+машин\w*\b"),
+        "ленточная шлифмашина",
+    ),
+    (
+        re.compile(
+            r"\b(?:эксцентриков\w*|орбитальн\w*)\s+"
+            r"шлифовальн\w*\s+машин\w*\b"
+        ),
+        "орбитальная шлифмашина",
+    ),
+    (
+        re.compile(r"\bвибрационн\w*\s+шлифовальн\w*\s+машин\w*\b"),
+        "вибрационная шлифмашина",
+    ),
     (re.compile(r"\bуглошлифовальн\w*\s+машин\w*\b"), "ушм"),
     (re.compile(r"\bшлифовальн\w*\s+машин\w*\b"), "ушм"),
     (re.compile(r"\bболгарк\w*\b"), "ушм"),
@@ -18,6 +35,41 @@ _DOMAIN_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bгкл\b"), "гкл гипсокартон"),
     (re.compile(r"\bсдс\b"), "sds"),
     (re.compile(r"\bлс\b"), "ls"),
+)
+
+# Признаки, которые меняют сам вариант товара.
+# Если покупатель явно указал такой признак, кандидат должен его содержать.
+_QUALIFIER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"\b(?:по\s+дерев\w*|гипсокартон\s+дерев\w*)\b"),
+        "application:wood",
+    ),
+    (
+        re.compile(r"\b(?:по\s+металл\w*|гипсокартон\s+металл\w*)\b"),
+        "application:metal",
+    ),
+    (re.compile(r"\bпо\s+бетон\w*\b"), "application:concrete"),
+    (re.compile(r"\bпо\s+камн\w*\b"), "application:stone"),
+    (
+        re.compile(r"\bпо\s+нержав\w*(?:\s+стал\w*)?\b"),
+        "application:stainless",
+    ),
+    (re.compile(r"\bлазерн\w*\b"), "level:laser"),
+    (re.compile(r"\bпузырьков\w*\b"), "level:bubble"),
+    (re.compile(r"\bсамоконтр\w*\b"), "fastener:self_locking"),
+    (re.compile(r"\bленточн\w*\b"), "grinder:belt"),
+    (
+        re.compile(r"\b(?:эксцентриков\w*|орбитальн\w*)\b"),
+        "grinder:orbital",
+    ),
+    (re.compile(r"\bвибрационн\w*\b"), "grinder:vibrating"),
+    (re.compile(r"\bушм\b"), "grinder:angle"),
+    (re.compile(r"\bсин\w*\b"), "color:blue"),
+    (re.compile(r"\bкрасн\w*\b"), "color:red"),
+    (re.compile(r"\bчерн\w*\b"), "color:black"),
+    (re.compile(r"\bбел\w*\b"), "color:white"),
+    (re.compile(r"\bзелен\w*\b"), "color:green"),
+    (re.compile(r"\bжелт\w*\b"), "color:yellow"),
 )
 
 _QUERY_NOISE_RE = re.compile(
@@ -34,7 +86,7 @@ _NON_PRODUCT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _EXPLICIT_DIMENSION_RE = re.compile(
-    r"(?<![\w.])(\d+(?:\.\d+)?)"
+    r"(?<![\w.])(?:m\s*-?\s*)?(\d+(?:\.\d+)?)"
     r"\s*x\s*(\d+(?:\.\d+)?)"
     r"(?:\s*x\s*(\d+(?:\.\d+)?))?(?![\w.])"
 )
@@ -52,13 +104,16 @@ _CODE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# В M10x60 обычная граница слова после 10 отсутствует из-за x.
+_THREAD_CODE_RE = re.compile(
+    r"(?<!\w)m\s*-?\s*(\d+(?:\.\d+)?)(?=\s*x|\b)",
+    re.IGNORECASE,
+)
+
 _PACK_COUNT_RE = re.compile(
     r"\b(?:пачк\w*|упаковк\w*|уп\.?)\s*(?P<value>\d{2,5})\b"
 )
 
-# Числа в этих конструкциях описывают заказ, а не SKU. Их нельзя делать
-# жёсткими характеристиками товара: «2 дрели» и «10 метров кабеля» должны
-# матчиться так же, как «дрель» и «кабель», если сам товар указан достаточно точно.
 _ORDER_AMOUNT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\b(?P<value>\d+(?:\.\d+)?)\s*"
@@ -80,6 +135,7 @@ class QueryFeatures:
     normalized: str
     dimensions: tuple[tuple[float, ...], ...]
     codes: frozenset[str]
+    qualifiers: frozenset[str]
     quantities: tuple[tuple[float, str], ...]
     numbers: frozenset[float]
     pack_count: int | None
@@ -92,8 +148,6 @@ def _base_normalize(text: str) -> str:
     text = text.replace("×", "x")
     text = re.sub(r"(?<=\d)\s*[хx*]\s*(?=\d)", "x", text)
 
-    # Часто встречающиеся латинские обозначения единиц приводим к тем же
-    # формам, которые используются в русскоязычном каталоге.
     text = re.sub(r"(?<![a-z])mm\b", " мм", text)
     text = re.sub(r"(?<![a-z])cm\b", " см", text)
     text = re.sub(r"(?<![a-z])kg\b", " кг", text)
@@ -101,14 +155,11 @@ def _base_normalize(text: str) -> str:
     text = re.sub(r"(?<=\d)\s*w\b", " вт", text)
     text = re.sub(r"(?<=\d)\s*v\b", " в", text)
 
-    # Кириллические символы, похожие на латинские, в технических кодах.
     text = re.sub(r"\bм(?=\s*-?\s*\d)", "m", text)
     text = re.sub(r"\bр(?=\s*-?\s*\d)", "p", text)
 
-    # Приводим обозначение ВВГнг(А)-LS к единой форме.
     text = re.sub(r"\(\s*а\s*\)\s*-?\s*ls\b", " ls", text)
 
-    # Дефисы между словами заменяем пробелами, но сохраняем их в моделях PW-750.
     text = re.sub(r"(?<=[a-zа-я])-(?=[a-zа-я])", " ", text)
     text = re.sub(r"[()\[\]{},;:!?\"']+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -140,10 +191,11 @@ def extract_codes(text: str) -> frozenset[str]:
         for match in _CODE_RE.finditer(normalized)
     }
 
-    # Латинские слова в каталоге обычно являются сильными признаками:
-    # брендом, стандартом или частью модельного обозначения.
-    # Поэтому неизвестный бренд не должен матчиться на похожий товар
-    # другого производителя только из-за совпадения типа и мощности.
+    codes.update(
+        f"m{match.group(1)}"
+        for match in _THREAD_CODE_RE.finditer(normalized)
+    )
+
     codes.update(
         re.findall(
             r"(?<![a-z])\b[a-z]{2,}\b(?![a-z])",
@@ -152,6 +204,16 @@ def extract_codes(text: str) -> frozenset[str]:
     )
 
     return frozenset(codes)
+
+
+def extract_qualifiers(text: str) -> frozenset[str]:
+    normalized = normalize_text(text)
+
+    return frozenset(
+        qualifier
+        for pattern, qualifier in _QUALIFIER_PATTERNS
+        if pattern.search(normalized)
+    )
 
 
 def extract_dimensions(text: str) -> tuple[tuple[float, ...], ...]:
@@ -168,8 +230,6 @@ def extract_dimensions(text: str) -> tuple[tuple[float, ...], ...]:
             )
         )
 
-    # "190 на 48 зубьев" — это диаметр и число зубьев,
-    # а не геометрический размер 190x48.
     for match in _ON_DIMENSION_RE.finditer(normalized):
         tail = normalized[match.end() : match.end() + 20]
 
@@ -204,8 +264,6 @@ def extract_numbers(text: str) -> frozenset[float]:
         for match in pattern.finditer(normalized):
             ignored_spans.append(match.span("value"))
 
-    # Количество внутри упаковки уже хранится отдельным структурным признаком
-    # и не должно второй раз участвовать как обычное число.
     for match in _PACK_COUNT_RE.finditer(normalized):
         ignored_spans.append(match.span("value"))
 
@@ -269,6 +327,7 @@ def parse_query(text: str) -> QueryFeatures:
         normalized=normalize_text(text),
         dimensions=extract_dimensions(text),
         codes=extract_codes(text),
+        qualifiers=extract_qualifiers(text),
         quantities=extract_quantities(text),
         numbers=extract_numbers(text),
         pack_count=extract_pack_count(text),

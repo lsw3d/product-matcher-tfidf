@@ -5,7 +5,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.normalization import extract_codes, extract_dimensions, extract_numbers, extract_quantities, normalize_text
+from app.normalization import (
+    extract_codes,
+    extract_dimensions,
+    extract_numbers,
+    extract_qualifiers,
+    extract_quantities,
+    normalize_text,
+)
 
 
 _PACK_COUNT_RE = re.compile(r"\bуп\.?\s*(\d{2,5})\s*шт\b", re.IGNORECASE)
@@ -22,6 +29,7 @@ class CatalogItem:
     normalized_name: str
     dimensions: tuple[tuple[float, ...], ...]
     codes: frozenset[str]
+    qualifiers: frozenset[str]
     quantities: tuple[tuple[float, str], ...]
     numbers: frozenset[float]
     pack_count: int | None
@@ -44,11 +52,11 @@ class Catalog:
         with path.open("r", encoding="utf-8-sig", newline="") as file:
             reader = csv.DictReader(file)
 
-            # Проверяем структуру каталога сразу при загрузке:
-            # matcher дальше может рассчитывать на корректный формат данных.
             missing = cls.REQUIRED_COLUMNS - set(reader.fieldnames or [])
             if missing:
-                raise ValueError(f"Catalog is missing required columns: {sorted(missing)}")
+                raise ValueError(
+                    f"Catalog is missing required columns: {sorted(missing)}"
+                )
 
             for line_number, row in enumerate(reader, start=2):
                 sku = (row.get("sku") or "").strip()
@@ -56,20 +64,26 @@ class Catalog:
                 unit = (row.get("unit") or "").strip()
                 raw_price = (row.get("price") or "").strip()
 
-                # SKU — идентификатор товара, поэтому дубликат означает
-                # неоднозначность каталога и лучше должен сломать запуск,
-                # чем привести к неправильному matched.
                 if not sku or not name:
-                    raise ValueError(f"Empty sku/name at CSV line {line_number}")
+                    raise ValueError(
+                        f"Empty sku/name at CSV line {line_number}"
+                    )
+
                 if sku in seen_skus:
-                    raise ValueError(f"Duplicate sku {sku!r} at CSV line {line_number}")
+                    raise ValueError(
+                        f"Duplicate sku {sku!r} at CSV line {line_number}"
+                    )
 
                 try:
                     price = float(raw_price)
                 except ValueError as exc:
-                    raise ValueError(f"Invalid price at CSV line {line_number}: {raw_price!r}") from exc
+                    raise ValueError(
+                        f"Invalid price at CSV line "
+                        f"{line_number}: {raw_price!r}"
+                    ) from exc
 
                 pack_match = _PACK_COUNT_RE.search(normalize_text(name))
+
                 items.append(
                     CatalogItem(
                         sku=sku,
@@ -79,11 +93,17 @@ class Catalog:
                         normalized_name=normalize_text(name),
                         dimensions=extract_dimensions(name),
                         codes=extract_codes(name),
+                        qualifiers=extract_qualifiers(name),
                         quantities=extract_quantities(name),
                         numbers=extract_numbers(name),
-                        pack_count=int(pack_match.group(1)) if pack_match else None,
+                        pack_count=(
+                            int(pack_match.group(1))
+                            if pack_match
+                            else None
+                        ),
                     )
                 )
+
                 seen_skus.add(sku)
 
         return cls(items)

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 
 _DOMAIN_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bуглошлифовальн\w*\s+машин\w*\b"), "ушм"),
+    (re.compile(r"\bшлифовальн\w*\s+машин\w*\b"), "ушм"),
     (re.compile(r"\bболгарк\w*\b"), "ушм"),
     (re.compile(r"\bшурик\w*\b"), "шуруповерт"),
     (re.compile(r"\bпроф\.?\s*труб\w*\b"), "труба профильная"),
@@ -51,7 +53,25 @@ _CODE_RE = re.compile(
 )
 
 _PACK_COUNT_RE = re.compile(
-    r"\b(?:пачк\w*|упаковк\w*|уп\.?)\s*(\d{2,5})\b"
+    r"\b(?:пачк\w*|упаковк\w*|уп\.?)\s*(?P<value>\d{2,5})\b"
+)
+
+# Числа в этих конструкциях описывают заказ, а не SKU. Их нельзя делать
+# жёсткими характеристиками товара: «2 дрели» и «10 метров кабеля» должны
+# матчиться так же, как «дрель» и «кабель», если сам товар указан достаточно точно.
+_ORDER_AMOUNT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?P<value>\d+(?:\.\d+)?)\s*"
+        r"(?:шт(?:\.|ук\w*)?|штук\w*|метр\w*|м|килограмм\w*|кг|лист(?:а|ов|ами)?|пачк\w*|упаковк\w*)\b"
+    ),
+    re.compile(
+        r"\b(?:нужно|надо|дайте|возьму|хочу|закаж\w*|мне)\s+"
+        r"(?P<value>\d+(?:\.\d+)?)\b"
+    ),
+    re.compile(
+        r"\b(?:до|за|около|бюджет\w*|не\s+дороже)\s*"
+        r"(?P<value>\d+(?:\.\d+)?)\s*(?:руб(?:\.|лей|ля)?|₽)?\b"
+    ),
 )
 
 
@@ -71,6 +91,15 @@ def _base_normalize(text: str) -> str:
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
     text = text.replace("×", "x")
     text = re.sub(r"(?<=\d)\s*[хx*]\s*(?=\d)", "x", text)
+
+    # Часто встречающиеся латинские обозначения единиц приводим к тем же
+    # формам, которые используются в русскоязычном каталоге.
+    text = re.sub(r"(?<![a-z])mm\b", " мм", text)
+    text = re.sub(r"(?<![a-z])cm\b", " см", text)
+    text = re.sub(r"(?<![a-z])kg\b", " кг", text)
+    text = re.sub(r"(?<![a-z])ml\b", " мл", text)
+    text = re.sub(r"(?<=\d)\s*w\b", " вт", text)
+    text = re.sub(r"(?<=\d)\s*v\b", " в", text)
 
     # Кириллические символы, похожие на латинские, в технических кодах.
     text = re.sub(r"\bм(?=\s*-?\s*\d)", "m", text)
@@ -113,7 +142,7 @@ def extract_codes(text: str) -> frozenset[str]:
 
     # Латинские слова в каталоге обычно являются сильными признаками:
     # брендом, стандартом или частью модельного обозначения.
-    # Поэтому неизвестный бренд не должен матчиться на похожой товар
+    # Поэтому неизвестный бренд не должен матчиться на похожий товар
     # другого производителя только из-за совпадения типа и мощности.
     codes.update(
         re.findall(
@@ -169,9 +198,27 @@ def extract_quantities(text: str) -> tuple[tuple[float, str], ...]:
 def extract_numbers(text: str) -> frozenset[float]:
     normalized = normalize_text(text)
 
+    ignored_spans: list[tuple[int, int]] = []
+
+    for pattern in _ORDER_AMOUNT_PATTERNS:
+        for match in pattern.finditer(normalized):
+            ignored_spans.append(match.span("value"))
+
+    # Количество внутри упаковки уже хранится отдельным структурным признаком
+    # и не должно второй раз участвовать как обычное число.
+    for match in _PACK_COUNT_RE.finditer(normalized):
+        ignored_spans.append(match.span("value"))
+
+    def is_order_amount(start: int, end: int) -> bool:
+        return any(
+            start >= ignored_start and end <= ignored_end
+            for ignored_start, ignored_end in ignored_spans
+        )
+
     return frozenset(
-        float(value)
-        for value in re.findall(r"\d+(?:\.\d+)?", normalized)
+        float(match.group(0))
+        for match in re.finditer(r"\d+(?:\.\d+)?", normalized)
+        if not is_order_amount(*match.span())
     )
 
 
@@ -180,7 +227,7 @@ def extract_pack_count(text: str) -> int | None:
 
     match = _PACK_COUNT_RE.search(normalized)
 
-    return int(match.group(1)) if match else None
+    return int(match.group("value")) if match else None
 
 
 def extract_unit_hint(text: str) -> str | None:
@@ -195,7 +242,7 @@ def extract_unit_hint(text: str) -> str | None:
     if re.search(r"\b(?:за\s+метр|погонн\w*\s+метр)\b", normalized):
         return "м"
 
-    if re.search(r"\bлистами\b", normalized):
+    if re.search(r"\bлист(?:а|ов|ами)?\b", normalized):
         return "лист"
 
     return None

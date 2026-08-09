@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from scipy.sparse import csr_matrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 from app.catalog import Catalog, CatalogItem
-from app.normalization import QueryFeatures, is_explicitly_non_product, parse_query, retrieval_text
+from app.normalization import (
+    QueryFeatures,
+    is_explicitly_non_product,
+    parse_query,
+    retrieval_text,
+)
 from app.schemas import Candidate, MatchResult
 
 
@@ -46,7 +50,7 @@ class ProductMatcher:
 
         # Индекс каталога строится один раз, дальше каждый запрос
         # сравнивается с уже готовой разреженной матрицей.
-        self.catalog_matrix: csr_matrix = self.vectorizer.fit_transform(
+        self.catalog_matrix = self.vectorizer.fit_transform(
             [item.normalized_name for item in catalog.items]
         ).tocsr()
 
@@ -57,17 +61,24 @@ class ProductMatcher:
             return self._not_found(message)
 
         features = parse_query(message)
+
         if len(features.normalized) < 2:
             return self._not_found(message)
 
         # Первый этап — широкий retrieval по текстовой похожести.
         query_vector = self.vectorizer.transform([retrieval_text(message)])
-        similarities = (self.catalog_matrix @ query_vector.T).toarray().ravel()
+        similarities = (
+            self.catalog_matrix @ query_vector.T
+        ).toarray().ravel()
 
-        if similarities.size == 0 or float(similarities.max()) < self.AMBIGUOUS_THRESHOLD:
+        if (
+            similarities.size == 0
+            or float(similarities.max()) < self.AMBIGUOUS_THRESHOLD
+        ):
             return self._not_found(message)
 
         ranked: list[_Ranked] = []
+
         for idx, text_score_raw in enumerate(similarities):
             item = self.catalog.items[idx]
             text_score = float(text_score_raw)
@@ -77,17 +88,23 @@ class ProductMatcher:
             # размеры, модель, напряжение, упаковку и т.д.
             if text_score < self.AMBIGUOUS_THRESHOLD:
                 continue
+
             if not self._hard_compatible(item, features):
                 continue
+
             ranked.append(
                 _Ranked(
                     item=item,
                     text_score=text_score,
-                    score=self._rerank(text_score, item, features),
+                    score=self._rerank(text_score, features),
                 )
             )
 
-        ranked.sort(key=lambda result: result.score, reverse=True)
+        ranked.sort(
+            key=lambda result: result.score,
+            reverse=True,
+        )
+
         if not ranked or ranked[0].score < self.AMBIGUOUS_THRESHOLD:
             return self._not_found(message)
 
@@ -97,7 +114,10 @@ class ProductMatcher:
 
         # Для matched недостаточно просто высокого score:
         # лидер должен ещё заметно отрываться от второго кандидата.
-        if top.score >= self.MATCH_THRESHOLD and margin >= self.MATCH_MARGIN:
+        if (
+            top.score >= self.MATCH_THRESHOLD
+            and margin >= self.MATCH_MARGIN
+        ):
             return MatchResult(
                 message=message,
                 status="matched",
@@ -116,83 +136,173 @@ class ProductMatcher:
             return MatchResult(
                 message=message,
                 status="ambiguous",
-                candidates=[self._candidate(candidate) for candidate in candidates],
+                candidates=[
+                    self._candidate(candidate)
+                    for candidate in candidates
+                ],
             )
 
         # Один слабый fuzzy-кандидат считаем недостаточным основанием для ответа.
         return self._not_found(message)
 
-    def match_many(self, messages: list[str]) -> list[MatchResult]:
-        return [self.match(message) for message in messages]
+    def match_many(
+        self,
+        messages: list[str],
+    ) -> list[MatchResult]:
+        return [
+            self.match(message)
+            for message in messages
+        ]
 
     @staticmethod
-    def _hard_compatible(item: CatalogItem, query: QueryFeatures) -> bool:
+    def _hard_compatible(
+        item: CatalogItem,
+        query: QueryFeatures,
+    ) -> bool:
         # Явно указанные покупателем характеристики считаем жёсткими условиями.
         # Например запрос M10 не должен матчиться с M8 даже при похожем названии.
-        if query.unit_hint is not None and item.unit != query.unit_hint:
+        if (
+            query.unit_hint is not None
+            and item.unit != query.unit_hint
+        ):
             return False
 
-        if query.pack_count is not None and item.pack_count != query.pack_count:
+        if (
+            query.pack_count is not None
+            and item.pack_count != query.pack_count
+        ):
             return False
 
-        if query.codes and not query.codes.issubset(item.codes):
+        if (
+            query.codes
+            and not query.codes.issubset(item.codes)
+        ):
             return False
 
-        if query.numbers and not query.numbers.issubset(item.numbers):
+        if (
+            query.numbers
+            and not query.numbers.issubset(item.numbers)
+        ):
             return False
 
         for requested in query.dimensions:
-            if not any(ProductMatcher._dimension_prefix_match(requested, actual) for actual in item.dimensions):
+            if not any(
+                ProductMatcher._dimension_prefix_match(
+                    requested,
+                    actual,
+                )
+                for actual in item.dimensions
+            ):
                 return False
 
-        # Значения с единицами измерения — сильный сигнал:
-        # например 1000 мм, 12 В или 750 Вт.
-        # Числа из размеров отдельно не проверяем второй раз.
-        dimension_values = {value for dimension in query.dimensions for value in dimension}
+        # Величина в той же единице, в которой продаётся позиция, описывает
+        # объём заказа, а не характеристику SKU: например "10 м кабеля".
+        # Остальные величины (125 мм, 12 В, 750 Вт) остаются hard constraints.
+        dimension_values = {
+            value
+            for dimension in query.dimensions
+            for value in dimension
+        }
+
         item_quantity_set = set(item.quantities)
+
         for value, unit in query.quantities:
-            if value in dimension_values:
+            if (
+                value in dimension_values
+                or unit == item.unit
+            ):
                 continue
+
             if (value, unit) not in item_quantity_set:
                 return False
 
         return True
 
     @staticmethod
-    def _dimension_prefix_match(requested: tuple[float, ...], actual: tuple[float, ...]) -> bool:
+    def _dimension_prefix_match(
+        requested: tuple[float, ...],
+        actual: tuple[float, ...],
+    ) -> bool:
         # Частично указанный размер допустим:
         # запрос 20x20 может соответствовать позиции 20x20x2.
         if len(requested) > len(actual):
             return False
+
         return requested == actual[: len(requested)]
 
     @staticmethod
-    def _rerank(text_score: float, item: CatalogItem, query: QueryFeatures) -> float:
-        # После текстового retrieval повышаем score кандидата,
-        # если запрос содержит точные структурные характеристики.
-        score = text_score
+    def _rerank(
+        text_score: float,
+        query: QueryFeatures,
+    ) -> float:
+        # Структурные признаки повышают уверенность, но не складываются с
+        # similarity напрямую. Так score остаётся в [0, 1], а один и тот же
+        # размер не может несколько раз искусственно довести confidence до 1.0.
+        structural_strength = 0.0
 
         if query.dimensions:
-            score += 0.16
+            structural_strength += 0.30
+
         if query.codes:
-            score += 0.14
-        if query.quantities:
-            score += 0.08
-        if query.numbers:
-            score += 0.08
+            structural_strength += 0.25
+
+        dimension_values = {
+            value
+            for dimension in query.dimensions
+            for value in dimension
+        }
+
+        has_independent_quantity = any(
+            value not in dimension_values
+            for value, _ in query.quantities
+        )
+
+        if has_independent_quantity:
+            structural_strength += 0.15
+
+        # Голые технические числа полезны для запросов вроде "УШМ на 230"
+        # или "диск 190 на 48 зубьев". Если уже есть более точный структурный
+        # признак, отдельный бонус за те же числа не начисляем.
+        if query.numbers and not (
+            query.dimensions
+            or query.codes
+            or has_independent_quantity
+        ):
+            structural_strength += 0.16
+
         if query.pack_count is not None:
-            score += 0.08
+            structural_strength += 0.15
+
         if query.unit_hint is not None:
-            score += 0.04
+            structural_strength += 0.08
 
-        return score
+        structural_strength = min(
+            structural_strength,
+            0.55,
+        )
+
+        # Бонус приближает score к 1, но никогда не пересекает её и сохраняет
+        # различия между кандидатами с разной исходной текстовой похожестью.
+        return (
+            text_score
+            + (1.0 - text_score) * structural_strength
+        )
 
     @staticmethod
-    def _candidate(result: _Ranked) -> Candidate:
-        # Внутренний score может быть больше 1 из-за бонусов rerank,
-        # поэтому внешний confidence ограничиваем контрактом [0, 1].
-        return Candidate(sku=result.item.sku, confidence=round(min(1.0, result.score), 3))
+    def _candidate(
+        result: _Ranked,
+    ) -> Candidate:
+        return Candidate(
+            sku=result.item.sku,
+            confidence=round(result.score, 3),
+        )
 
     @staticmethod
-    def _not_found(message: str) -> MatchResult:
-        return MatchResult(message=message, status="not_found", candidates=[])
+    def _not_found(
+        message: str,
+    ) -> MatchResult:
+        return MatchResult(
+            message=message,
+            status="not_found",
+            candidates=[],
+        )

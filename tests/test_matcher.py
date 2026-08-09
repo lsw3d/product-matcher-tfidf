@@ -268,3 +268,70 @@ def test_grinder_wording_does_not_return_abrasives(
         candidate.sku.startswith("INS-")
         for candidate in result.candidates
     )
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "плитка 30х30",
+        "анкер 10х100",
+    ],
+)
+def test_matching_dimension_does_not_replace_product_type(
+    matcher: ProductMatcher,
+    message: str,
+) -> None:
+    result = matcher.match(message)
+
+    assert result.status == "not_found"
+    assert result.candidates == []
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_sku"),
+    [
+        (
+            "2 дрели prowerk pw-750",
+            "INS-0008",
+        ),
+        (
+            "кабель шввп 2х0.5 метров 10",
+            "KAB-0017",
+        ),
+    ],
+)
+def test_bare_order_amount_does_not_become_product_constraint(
+    matcher: ProductMatcher,
+    message: str,
+    expected_sku: str,
+) -> None:
+    result = matcher.match(message)
+
+    assert result.status == "matched"
+    assert result.candidates[0].sku == expected_sku
+
+
+def test_bare_order_amount_keeps_packaging_ambiguity(
+    matcher: ProductMatcher,
+) -> None:
+    result = matcher.match(
+        "20 саморезов по дереву 3.5х45"
+    )
+
+    assert result.status == "ambiguous"
+    assert {
+        candidate.sku
+        for candidate in result.candidates
+    } == {
+        "SAM-0010",
+        "SAM-0011",
+        "SAM-0012",
+    }
+
+
+def test_exact_catalog_name_beats_close_variant(
+    matcher: ProductMatcher,
+) -> None:
+    result = matcher.match("кабель ввгнг 3х1.5")
+
+    assert result.status == "matched"
+    assert result.candidates[0].sku == "KAB-0002"

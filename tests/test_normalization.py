@@ -147,3 +147,27 @@ def test_semantic_qualifiers() -> None:
     assert extract_qualifiers(
         "ленточная шлифовальная машина"
     ) == frozenset({"grinder:belt"})
+
+
+def test_bare_order_amounts_are_not_product_numbers() -> None:
+    assert 2.0 not in extract_numbers(
+        "2 дрели prowerk pw-750"
+    )
+
+    assert 20.0 not in extract_numbers(
+        "20 саморезов по дереву 3.5х45"
+    )
+
+    assert 10.0 not in extract_numbers(
+        "кабель шввп 2х0.5 метров 10"
+    )
+
+
+def test_incidental_latin_word_is_not_code() -> None:
+    codes = extract_codes(
+        "please дрель prowerk pw-750"
+    )
+
+    assert "please" not in codes
+    assert "prowerk" in codes
+    assert "pw750" in codes

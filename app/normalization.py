@@ -100,7 +100,17 @@ _NUMBER_WITH_UNIT_RE = re.compile(
 )
 
 _CODE_RE = re.compile(
-    r"\b(?:ph|pz|t|sl|m|p|pw|тр|арс|tk)\s*-?\s*\d+(?:\.\d+)?(?:[a-zа-я])?\b",
+    r"\b(?:ph|pz|t|sl|m|p|pw|din|тр|арс|tk)\s*-?\s*\d+(?:\.\d+)?(?:[a-zа-я])?\b",
+    re.IGNORECASE,
+)
+
+_STANDALONE_CODE_RE = re.compile(r"\b(?:sds|ls)\b", re.IGNORECASE)
+
+# Латинское слово считаем брендом только в типичной позиции после русского
+# названия товара: «дрель bosch», «дрель prowerk». Случайное английское
+# слово в другой части сообщения больше не становится hard constraint.
+_BRAND_AFTER_PRODUCT_RE = re.compile(
+    r"\b[а-я]+(?:\s+[а-я]+){0,2}\s+(?P<brand>[a-z]{3,})\b",
     re.IGNORECASE,
 )
 
@@ -118,6 +128,13 @@ _ORDER_AMOUNT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\b(?P<value>\d+(?:\.\d+)?)\s*"
         r"(?:шт(?:\.|ук\w*)?|штук\w*|метр\w*|м|килограмм\w*|кг|лист(?:а|ов|ами)?|пачк\w*|упаковк\w*)\b"
+    ),
+    re.compile(
+        r"\b(?:шт(?:\.|ук\w*)?|штук\w*|метр\w*|килограмм\w*|кг|лист(?:а|ов)?|пачк\w*|упаковк\w*)\s+"
+        r"(?P<value>\d+(?:\.\d+)?)\b"
+    ),
+    re.compile(
+        r"^\s*(?P<value>\d+(?:\.\d+)?)\s+(?=[a-zа-я])"
     ),
     re.compile(
         r"\b(?:нужно|надо|дайте|возьму|хочу|закаж\w*|мне)\s+"
@@ -197,10 +214,14 @@ def extract_codes(text: str) -> frozenset[str]:
     )
 
     codes.update(
-        re.findall(
-            r"(?<![a-z])\b[a-z]{2,}\b(?![a-z])",
-            normalized,
-        )
+        match.group(0).lower()
+        for match in _STANDALONE_CODE_RE.finditer(normalized)
+    )
+
+    codes.update(
+        match.group("brand").lower()
+        for match in _BRAND_AFTER_PRODUCT_RE.finditer(normalized)
+        if match.group("brand").lower() not in {"sds", "plus", "ls"}
     )
 
     return frozenset(codes)
@@ -318,6 +339,33 @@ def is_explicitly_non_product(text: str) -> bool:
 def retrieval_text(text: str) -> str:
     normalized = normalize_text(text)
     normalized = _QUERY_NOISE_RE.sub(" ", normalized)
+
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def lexical_text(text: str) -> str:
+    """Текстовые признаки товара без числовых характеристик и моделей."""
+    normalized = retrieval_text(text)
+
+    # Убираем модели и размерные токены: они используются отдельно как
+    # structural constraints и не должны сами доказывать тип товара.
+    normalized = re.sub(
+        r"\b[a-zа-я]+-?\d[\w.-]*\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?<!\w)\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)+(?!\w)",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(r"\d+(?:\.\d+)?", " ", normalized)
+    normalized = re.sub(
+        r"\b(?:мм|см|м|вт|дж|г|кг|мл|л|шт|уп|на)\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(r"[^a-zа-я]+", " ", normalized)
 
     return re.sub(r"\s+", " ", normalized).strip()
 

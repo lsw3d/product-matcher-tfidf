@@ -8,6 +8,7 @@ from app.catalog import Catalog, CatalogItem
 from app.normalization import (
     QueryFeatures,
     is_explicitly_non_product,
+    lexical_text,
     parse_query,
     retrieval_text,
 )
@@ -30,6 +31,7 @@ class ProductMatcher:
     # чем уверенно сопоставить сообщение с неправильным товаром.
     MATCH_THRESHOLD = 0.46
     AMBIGUOUS_THRESHOLD = 0.18
+    LEXICAL_COMPATIBILITY_THRESHOLD = 0.18
     MATCH_MARGIN = 0.06
     AMBIGUOUS_WINDOW = 0.10
     MAX_AMBIGUOUS_CANDIDATES = 3
@@ -66,7 +68,8 @@ class ProductMatcher:
             return self._not_found(message)
 
         # Первый этап — широкий retrieval по текстовой похожести.
-        query_vector = self.vectorizer.transform([retrieval_text(message)])
+        query_text = retrieval_text(message)
+        query_vector = self.vectorizer.transform([query_text])
         similarities = (
             self.catalog_matrix @ query_vector.T
         ).toarray().ravel()
@@ -76,6 +79,18 @@ class ProductMatcher:
             or float(similarities.max()) < self.AMBIGUOUS_THRESHOLD
         ):
             return self._not_found(message)
+
+        # Размеры, мощность и коды помогают выбрать вариант товара, но не
+        # должны сами доказывать его тип. Поэтому отдельно проверяем текстовую
+        # близость запроса без числовых характеристик и моделей.
+        lexical_query = lexical_text(message)
+        lexical_similarities = None
+
+        if lexical_query:
+            lexical_vector = self.vectorizer.transform([lexical_query])
+            lexical_similarities = (
+                self.catalog_matrix @ lexical_vector.T
+            ).toarray().ravel()
 
         ranked: list[_Ranked] = []
 
@@ -87,6 +102,13 @@ class ProductMatcher:
             # После него применяем строгие товарные ограничения:
             # размеры, модель, напряжение, упаковку и т.д.
             if text_score < self.AMBIGUOUS_THRESHOLD:
+                continue
+
+            if (
+                lexical_similarities is not None
+                and float(lexical_similarities[idx])
+                < self.LEXICAL_COMPATIBILITY_THRESHOLD
+            ):
                 continue
 
             if not self._hard_compatible(item, features):
@@ -109,6 +131,17 @@ class ProductMatcher:
             return self._not_found(message)
 
         top = ranked[0]
+
+        # После нормализации и удаления разговорного шума точное название
+        # позиции — достаточное основание для matched даже при наличии очень
+        # похожей соседней модификации в каталоге.
+        if query_text == top.item.normalized_name:
+            return MatchResult(
+                message=message,
+                status="matched",
+                candidates=[self._candidate(top)],
+            )
+
         second = ranked[1].score if len(ranked) > 1 else 0.0
         margin = top.score - second
 

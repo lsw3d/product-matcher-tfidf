@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -16,9 +15,6 @@ from app.normalization import (
     token_key,
 )
 from app.schemas import Candidate, MatchResult
-
-
-_ADJECTIVE_RE = re.compile(r"(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ых|их|ым|им|ую|юю|ого|его|ому|ему)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +35,7 @@ class ProductMatcher:
     LEXICAL_TOKEN_SIMILARITY_THRESHOLD = 0.76
     MIN_FUZZY_TOKEN_LENGTH = 4
     NOISE_TOKEN_PENALTY = 0.92
+    HEAD_NOISE_PENALTY = 0.6
 
     def __init__(self, catalog: Catalog) -> None:
         self.catalog = catalog
@@ -74,6 +71,9 @@ class ProductMatcher:
             for code in item.codes:
                 for variant in code_variants(code):
                     self.catalog_codes_by_variant.setdefault(variant, code)
+
+    def match_many(self, messages: list[str]) -> list[MatchResult]:
+        return [self.match(message) for message in messages]
 
     def match(self, message: str) -> MatchResult:
         if not message.strip() or contains_negative_number(message):
@@ -180,6 +180,7 @@ class ProductMatcher:
             item = self.catalog.items[index]
             item_tokens = self.catalog_lexical_tokens[index]
             noise_tokens = 0
+            head_conflict = False
             if lexical_tokens:
                 if explicit_family is not None:
                     if not item_tokens or not self._tokens_are_similar(explicit_family, item_tokens[0]):
@@ -188,18 +189,21 @@ class ProductMatcher:
                     first_key = token_key(lexical_tokens[0])
                     if not any(first_key == token_key(token) for token in item_tokens):
                         continue
-                counted = self._count_noise_tokens(anchored_tokens, item_tokens, explicit_family)
+                counted = self._count_noise_tokens(
+                    anchored_tokens, item_tokens, explicit_family, bool(features.codes)
+                )
                 if counted is None:
                     continue
-                noise_tokens = counted
+                noise_tokens, head_conflict = counted
 
             if self._hard_compatible(item, features):
-                score = self._rerank(text_score, features) * self.NOISE_TOKEN_PENALTY**noise_tokens
+                score = (
+                    self._rerank(text_score, features)
+                    * self.NOISE_TOKEN_PENALTY**noise_tokens
+                    * (self.HEAD_NOISE_PENALTY if head_conflict else 1.0)
+                )
                 ranked.append(_Ranked(item, score, noise_tokens))
         return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
-
-    def match_many(self, messages: list[str]) -> list[MatchResult]:
-        return [self.match(message) for message in messages]
 
     @staticmethod
     def _names_a_product(features: QueryFeatures) -> bool:
@@ -270,29 +274,41 @@ class ProductMatcher:
         query_tokens: tuple[str, ...],
         item_tokens: tuple[str, ...],
         family: str | None,
-    ) -> int | None:
-        """Сколько слов запроса товар не объясняет, или None при конфликте.
+        code_pinned: bool,
+    ) -> tuple[int, bool] | None:
+        """Необъяснённые слова запроса: сколько их и есть ли среди них вершина.
 
         Требовать, чтобы каждое слово запроса нашлось в названии товара,
-        нельзя: покупатель пишет живым языком и добавляет `подскажите`,
-        `самовывоз`, `в бухте`. Но и игнорировать всё подряд опасно, поэтому
-        непривязанное слово отбрасывает кандидата в двух случаях: каталог
-        знает это слово (значит, оно противоречит товару) либо оно стоит на
-        месте уточнения типа сразу после названия семейства.
+        нельзя: покупатель пишет живым языком и добавляет `самовывоз`,
+        `в бухте`, `спасибо`. Но и игнорировать всё подряд опасно.
+
+        Возвращает `None`, если слово прямо противоречит товару, иначе —
+        число необъяснённых слов и признак того, что одно из них стоит перед
+        названием семейства.
         """
         anchor = query_tokens.index(family) if family in query_tokens else 0
         noise = 0
+        head_conflict = False
         for position, token in enumerate(query_tokens):
             if any(self._tokens_are_similar(token, item) for item in item_tokens):
                 continue
+            # Каталог знает это слово, но у данного товара его нет — значит,
+            # оно товару противоречит (`саморез мебельный`, `уровень лазерный`).
             if token_key(token) in self.catalog_vocabulary:
                 return None
-            if position == anchor + 1:
+            # Сразу справа от семейства стоит уточнение типа (`дюбель
+            # бабочка`, `диск алмазный`). Исключение — названная маркировка:
+            # она определяет товар точнее любого слова (`отвертка PH2`).
+            if position == anchor + 1 and not code_pinned:
                 return None
-            if position == anchor - 1 and _ADJECTIVE_RE.search(token):
-                return None
+            # Слева от семейства стоит либо вежливый оборот (`посмотрите
+            # дрель`), либо вершина словосочетания (`унитаз подвесной`,
+            # `напильник круглый`). Отличить их без морфологии нельзя,
+            # поэтому кандидата не отбрасываем, но сильно штрафуем: пережить
+            # штраф может только совпадение с прочими доказательствами.
+            head_conflict = head_conflict or position < anchor
             noise += 1
-        return noise
+        return noise, head_conflict
 
     @classmethod
     def _tokens_are_similar(cls, left: str, right: str) -> bool:

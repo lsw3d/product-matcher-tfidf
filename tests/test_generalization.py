@@ -23,6 +23,12 @@ NOISE_TOLERANT_CASES = [
     ("дрель prowerk pw-750 есть доставка?", "INS-0008"),
 ]
 
+# Разговорные синонимы расходников: в каталоге они называются дисками.
+COLLOQUIAL_NAME_CASES = [
+    ("лепестковый круг 125 p60", "DSK-0026"),
+    ("круг лепестковый 115 мм p40", "DSK-0021"),
+]
+
 # Кириллица в маркировке: каталог хранит их латиницей.
 CYRILLIC_CODE_CASES = [
     ("бита т30 25 мм", "BIT-0028"),
@@ -56,6 +62,26 @@ AMBIGUOUS_CASES = [
     ("нужны обычные саморезы по дереву 4.2х75", "SAM-"),
     ("сверло 10 мм", "BIT-"),
     ("нужен любой шуруповерт", "INS-"),
+    # Тире вместо запятой — не отрицательное число.
+    ("саморезы 3.5х45 - 200 шт", "SAM-"),
+    # Родительный падеж множественного числа: `пачек`, а не `пачк\w*`.
+    ("5 пачек саморезов по дереву 3.5х45", "SAM-"),
+    ("10 упаковок саморезов 3.5х45", "SAM-"),
+    # Названная маркировка важнее незнакомого слова рядом с семейством.
+    ("отвертка крестовая ph2", "RIN-"),
+    ("круг отрезной 125х1.2", "DSK-"),
+    # Товар назван, вопрос про доставку не должен его прятать.
+    ("здравствуйте! а есть саморезы по дереву 4.2х75 и когда доставите?", "SAM-"),
+]
+
+# Слово перед названием семейства — это вершина словосочетания. Если каталог
+# её не знает, спрашивают о другом товаре, даже когда остаток строки похож.
+UNKNOWN_HEAD_CASES = [
+    "унитаз подвесной",
+    "светильник подвесной",
+    "потолок подвесной 600х600",
+    "напильник круглый",
+    "стол разделочный",
 ]
 
 # Уточнение, которого нет в каталоге, — это другой товар, а не шум.
@@ -84,7 +110,12 @@ NON_PRODUCT_CASES = [
 
 @pytest.mark.parametrize(
     ("message", "expected_sku"),
-    [*NOISE_TOLERANT_CASES, *CYRILLIC_CODE_CASES, *INFLECTION_CASES],
+    [
+        *NOISE_TOLERANT_CASES,
+        *COLLOQUIAL_NAME_CASES,
+        *CYRILLIC_CODE_CASES,
+        *INFLECTION_CASES,
+    ],
 )
 def test_matched_without_tuning(
     matcher: ProductMatcher,
@@ -125,12 +156,37 @@ def test_ambiguous_without_tuning(
     )
 
 
-@pytest.mark.parametrize("message", [*UNKNOWN_SUBTYPE_CASES, *NON_PRODUCT_CASES])
+@pytest.mark.parametrize(
+    "message",
+    [*UNKNOWN_SUBTYPE_CASES, *UNKNOWN_HEAD_CASES, *NON_PRODUCT_CASES],
+)
 def test_not_found_without_tuning(matcher: ProductMatcher, message: str) -> None:
     result = matcher.match(message)
 
     assert result.status == "not_found"
     assert result.candidates == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "посмотрите дрель prowerk pw-750",
+        "гляньте дрель prowerk pw-750",
+    ],
+)
+def test_unlisted_polite_word_does_not_hide_named_product(
+    matcher: ProductMatcher,
+    message: str,
+) -> None:
+    """Слово перед семейством штрафует кандидата, но не отбрасывает его.
+
+    Перечислить все вежливые обороты нельзя, поэтому незнакомое слово в
+    позиции вершины должно лишь снижать уверенность.
+    """
+    result = matcher.match(message)
+
+    assert result.status != "not_found"
+    assert result.candidates[0].sku == "INS-0008"
 
 
 def test_noise_never_beats_an_exact_message(matcher: ProductMatcher) -> None:

@@ -2,6 +2,7 @@ import pytest
 
 from app.normalization import (
     code_variants,
+    contains_negative_number,
     extract_codes,
     extract_dimensions,
     extract_numbers,
@@ -111,6 +112,8 @@ def test_different_codes_stay_different() -> None:
         (10.0, "кабель шввп 2х0.5 метров 10"),
         (1.0, "1 дрель prowerk pw-750"),
         (2.0, "2 пары перчаток"),
+        (5.0, "5 пачек саморезов по дереву 3.5х45"),
+        (10.0, "10 упаковок саморезов 3.5х45"),
     ],
 )
 def test_order_amounts_are_not_product_numbers(value: float, source: str) -> None:
@@ -168,6 +171,23 @@ def test_pack_count(source: str, expected: int | None) -> None:
 def test_sale_unit_hints() -> None:
     assert extract_unit_hint("саморезы 3.5х45 уп.") == "уп"
     assert extract_unit_hint("пару перчаток") == "пара"
+    assert extract_unit_hint("5 пачек саморезов") == "уп"
+    assert extract_unit_hint("10 упаковок саморезов") == "уп"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("бита ph2 -50 мм", True),
+        ("диск отрезной 115х-1.2 мм", True),
+        # Тире здесь разделяет части сообщения, а не задаёт знак числа.
+        ("саморезы 3.5х45 - 200 шт", False),
+        ("хомут червячный 16 - 27 мм", False),
+        ("дрель prowerk pw - 750", False),
+    ],
+)
+def test_negative_numbers_are_told_from_dashes(source: str, expected: bool) -> None:
+    assert contains_negative_number(source) is expected
 
 
 def test_compound_codes_and_quantities() -> None:

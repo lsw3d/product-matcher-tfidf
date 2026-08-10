@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "product-matcher"
 version = "0.2.0"
 description = "Offline product matching with char n-gram TF-IDF and structural constraints"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115,<1.0",
     "pydantic>=2.9,<3.0",
